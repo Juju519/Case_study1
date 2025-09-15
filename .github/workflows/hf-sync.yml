@@ -1,20 +1,45 @@
-name: Sync to Hugging Face hub
+name: Sync to GitHub
+
 on:
   push:
     branches: [case_study_1_2025]
-
-  # to run this workflow manually from the Actions tab
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  sync-to-hub:
+  sync-to-github:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           lfs: true
-      - name: Push to hub
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Push to destination repo
         env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: git push --force https://rcpaffenroth:$HF_TOKEN@huggingface.co/spaces/rcpaffenroth/CSDS553_Demo HEAD:main
+          DEST_REPO_TOKEN: ${{ secrets.DEST_REPO_TOKEN }}
+        run: |
+          # Destination repo and branch
+          DEST_REPO="github.com/Juju519/Case_study1.git"
+          DEST_BRANCH="main"   # change if your target branch is different
+
+          # Add remote with token auth (token is redacted in logs)
+          git remote add mirror "https://${DEST_REPO_TOKEN}@${DEST_REPO}"
+
+          # If you need LFS objects:
+          git lfs install
+          git lfs fetch --all
+
+          # Push current HEAD to destination branch
+          # Use --force-with-lease if you truly want to overwrite; otherwise drop the flag.
+          git push mirror HEAD:${DEST_BRANCH} --force-with-lease
+
+          # Push tags too (optional)
+          # git push mirror --tags --force-with-lease
