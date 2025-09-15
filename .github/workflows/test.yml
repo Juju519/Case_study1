@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -17,9 +20,13 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install pytest gradio[oauth] huggingface_hub
+          python -m pip install --upgrade pip
+          # If you have a requirements.txt, prefer it:
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pytest gradio[oauth] huggingface_hub transformers torch
 
-      - name: Run pytest with HF token
+      - name: Run pytest (HF token optional)
         env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}            # optional if your tests hit HF
+          LOCAL_MODEL: sshleifer/tiny-gpt2             # keeps tests fast in CI
         run: pytest -q
