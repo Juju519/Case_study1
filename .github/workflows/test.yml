@@ -1,4 +1,4 @@
-name: Run chatbot test
+name: Run chatbot tests
 
 on:
   push:
@@ -6,27 +6,148 @@ on:
 
 permissions:
   contents: read
+  # pull-requests is only needed if you later decide to comment on PRs
+  # pull-requests: write
 
 jobs:
   test:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: ${{ runner.os }}-pip-
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # If you have a requirements.txt, prefer it:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install pytest gradio[oauth] huggingface_hub transformers torch
+          # pin gradio to quiet the warning and keep CI stable
+          pip install pytest transformers gradio==4.44.1 huggingface_hub
 
-      - name: Run pytest (HF token optional)
+      - name: Run tests (no OAuth; local path stubbed)
         env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}            # optional if your tests hit HF
-          LOCAL_MODEL: sshleifer/tiny-gpt2             # keeps tests fast in CI
+          SKIP_UI_ON_IMPORT: "1"            # prevents UI/OAuth from initializing during import
+          LOCAL_MODEL: sshleifer/tiny-gpt2  # keeps any fallback tiny/fast
+          GRADIO_ANALYTICS_ENABLED: "false"
         run: pytest -q
+
+      # Redundant but nice: explicit UI smoke without OAuth for clear logs
+      - name: UI smoke (no OAuth)
+        env:
+          SKIP_UI_ON_IMPORT: "1"
+        run: |
+          python - <<'PY'
+          import os
+          os.environ["SKIP_UI_ON_IMPORT"] = "1"
+          import gradio.oauth as oauth
+          oauth.attach_oauth = lambda app: None
+          import app
+          demo = app.create_demo(enable_oauth=False)
+          print("Built UI successfully:", type(demo).__name__)
+          PY
+
+  notify:
+    needs: test
+    runs-on: ubuntu-latest
+    if: always()   # run even if tests fail
+    steps:
+      - name: Determine status
+        id: status
+        run: |
+          echo "result=${{ needs.test.result }}" >> $GITHUB_OUTPUT
+          echo "run_url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> $GITHUB_OUTPUT
+          echo "commit_url=${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}" >> $GITHUB_OUTPUT
+          echo "branch=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          echo "actor=${{ github.actor }}" >> $GITHUB_OUTPUT
+          echo "repo=${{ github.repository }}" >> $GITHUB_OUTPUT
+
+      - name: Build payloads
+        id: payloads
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const result   = '${{ steps.status.outputs.result }}';   // success | failure | cancelled
+            const run_url  = '${{ steps.status.outputs.run_url }}';
+            const commit   = process.env.GITHUB_SHA;
+            const sha7     = commit.substring(0,7);
+            const branch   = '${{ steps.status.outputs.branch }}';
+            const actor    = '${{ steps.status.outputs.actor }}';
+            const repo     = '${{ steps.status.outputs.repo }}';
+            const commit_url = '${{ steps.status.outputs.commit_url }}';
+
+            const title = `CI ${result.toUpperCase()} — ${repo}@${branch}`;
+            const desc  = `Commit \`${sha7}\` by **${actor}**\n[View run](${run_url}) · [Commit](${commit_url})`;
+
+            // Discord colors: green=0x57F287, red=0xED4245, yellow=0xFEE75C
+            const colors = { success: 5763719, failure: 15548997, cancelled: 16776960 };
+
+            const discordPayload = {
+              username: "CI Bot",
+              embeds: [{
+                title,
+                description: desc,
+                color: colors[result] ?? 5793266,
+                timestamp: new Date().toISOString(),
+                fields: [
+                  { name: "Repository", value: repo, inline: true },
+                  { name: "Branch", value: branch, inline: true },
+                  { name: "Status", value: result, inline: true }
+                ]
+              }]
+            };
+
+            // Slack attachments: colors "good" | "danger" | "warning"
+            const slackColor = result === "success" ? "good" : (result === "failure" ? "danger" : "warning");
+            const slackPayload = {
+              text: title,
+              attachments: [{
+                color: slackColor,
+                fields: [
+                  { title: "Repository", value: repo, short: true },
+                  { title: "Branch", value: branch, short: true },
+                  { title: "Status", value: result, short: true },
+                  { title: "Commit", value: `\`${sha7}\``, short: true }
+                ],
+                actions: [
+                  { type: "button", text: "View Run", url: run_url },
+                  { type: "button", text: "View Commit", url: commit_url }
+                ]
+              }]
+            };
+
+            core.setOutput("discord", JSON.stringify(discordPayload));
+            core.setOutput("slack", JSON.stringify(slackPayload));
+
+      - name: Send Discord (if webhook set)
+        if: ${{ secrets.DISCORD_WEBHOOK_URL != '' }}
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          PAYLOAD: ${{ steps.payloads.outputs.discord }}
+        run: |
+          curl -sS -X POST \
+            -H "Content-Type: application/json" \
+            --data "$PAYLOAD" \
+            "$DISCORD_WEBHOOK_URL" || true
+
+      - name: Send Slack (if webhook set)
+        if: ${{ secrets.SLACK_WEBHOOK_URL != '' }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          PAYLOAD: ${{ steps.payloads.outputs.slack }}
+        run: |
+          curl -sS -X POST \
+            -H "Content-Type: application/json" \
+            --data "$PAYLOAD" \
+            "$SLACK_WEBHOOK_URL" || true
