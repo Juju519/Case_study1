@@ -1,3 +1,4 @@
+# .github/workflows/sync-to-github.yml
 name: Sync to GitHub
 
 on:
@@ -6,40 +7,32 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write   # <-- critical
 
 jobs:
   sync-to-github:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout (no persisted creds)
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
           lfs: true
+          persist-credentials: false
 
-      - name: Configure git
+      - name: Git LFS
+        run: git lfs install
+
+      - name: Configure git author
         run: |
-          git config user.name "github-actions[bot]"
+          git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Push to destination repo
+      - name: Push to branch with GITHUB_TOKEN
         env:
-          DEST_REPO_TOKEN: ${{ secrets.DEST_REPO_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          # Destination repo and branch
-          DEST_REPO="github.com/Juju519/Case_study1.git"
-          DEST_BRANCH="main"   # change if your target branch is different
-
-          # Add remote with token auth (token is redacted in logs)
-          git remote add mirror "https://${DEST_REPO_TOKEN}@${DEST_REPO}"
-
-          # If you need LFS objects:
-          git lfs install
-          git lfs fetch --all
-
-          # Push current HEAD to destination branch
-          # Use --force-with-lease if you truly want to overwrite; otherwise drop the flag.
-          git push mirror HEAD:${DEST_BRANCH} --force-with-lease
-
-          # Push tags too (optional)
-          # git push mirror --tags --force-with-lease
+          # Repoint origin to include token
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          # Push current HEAD to case_study_1_2025
+          git push origin HEAD:case_study_1_2025 --force-with-lease
