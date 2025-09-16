@@ -11,12 +11,13 @@ permissions:
 jobs:
   notify:
     runs-on: ubuntu-latest
-
     steps:
       - name: Guard: ensure webhook is set
         id: guard
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
-          if [ -z "${{ secrets.DISCORD_WEBHOOK_URL }}" ]; then
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
             echo "Webhook secret DISCORD_WEBHOOK_URL is not set. Skipping."
             echo "continue=false" >> $GITHUB_OUTPUT
           else
@@ -38,7 +39,6 @@ jobs:
             const message = head?.message || (context.payload.commits?.length ? `${context.payload.commits.length} commits pushed` : "(no message)");
             const compare = context.payload.compare || `https://github.com/${repo}/commit/${sha}`;
 
-            // Discord embed (colors: green=5763719, red=15548997, yellow=16776960, purple-ish=5814783)
             const embed = {
               title: `Push to ${branch}`,
               url: compare,
@@ -52,13 +52,7 @@ jobs:
               timestamp: new Date().toISOString()
             };
 
-            const payload = {
-              username: "CI Bot",
-              // Set content to "@here" or "<@&ROLE_ID>" if you want a ping:
-              // content: null,
-              embeds: [embed]
-            };
-
+            const payload = { username: "CI Bot", embeds: [embed] };
             core.setOutput("json", JSON.stringify(payload));
 
       - name: Send Discord notification
