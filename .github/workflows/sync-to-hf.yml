@@ -1,0 +1,69 @@
+name: Sync to Hugging Face Space
+
+on:
+  push:
+    branches: [case_study_1_2025]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-to-hf
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+          persist-credentials: false   # use our own token, not GITHUB_TOKEN
+
+      - name: Ensure Git LFS
+        run: git lfs install
+
+      - name: Guard: ensure HF_TOKEN exists
+        id: guard
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          if [ -z "$HF_TOKEN" ]; then
+            echo "HF_TOKEN secret is missing. Add it in Settings → Secrets and variables → Actions."
+            echo "continue=false" >> $GITHUB_OUTPUT
+          else
+            echo "continue=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Configure Git author
+        if: steps.guard.outputs.continue == 'true'
+        run: |
+          git config user.name  "${{ github.actor }}"
+          git config user.email "${{ github.actor }}@users.noreply.github.com"
+
+      # Some actions inject extra headers; make sure we don't send GitHub auth to HF
+      - name: Clear any extra headers for huggingface.co
+        if: steps.guard.outputs.continue == 'true'
+        run: |
+          git config --global --unset-all http.https://huggingface.co/.extraheader || true
+
+      - name: Push to Space main (jujubean519/CSDS553_Demo)
+        if: steps.guard.outputs.continue == 'true'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          HF_SPACE="jujubean519/CSDS553_Demo"
+
+          # Add or update the 'hf' remote using the token
+          if git remote get-url hf >/dev/null 2>&1; then
+            git remote set-url hf "https://user:${HF_TOKEN}@huggingface.co/spaces/${HF_SPACE}.git"
+          else
+            git remote add hf "https://user:${HF_TOKEN}@huggingface.co/spaces/${HF_SPACE}.git"
+          fi
+
+          # Push current commit to the Space's deploy branch (main).
+          # --force-with-lease is safe and handles non-fast-forward if Space moved ahead.
+          git push hf HEAD:main --force-with-lease
