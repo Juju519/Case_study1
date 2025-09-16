@@ -49,11 +49,23 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
+          set -e
           HF_SPACE="jujubean519/CSDS553_Demo"
 
           # Reset or add the 'hf' remote with token auth
           git remote remove hf 2>/dev/null || true
           git remote add hf "https://user:${HF_TOKEN}@huggingface.co/spaces/${HF_SPACE}.git"
 
-          # Push current commit to the Space deploy branch
-          git push hf HEAD:main --force-with-lease
+          # 1) Fetch remote main so the lease has a known expected OID
+          git fetch hf main --prune
+
+          # 2) Get the current remote OID for refs/heads/main
+          REMOTE_OID="$(git rev-parse --verify -q hf/main || echo '')"
+
+          # 3) Push with a lease if we know the remote OID; otherwise fall back to --force
+          if [ -n "$REMOTE_OID" ]; then
+            git push hf HEAD:main --force-with-lease=refs/heads/main:"$REMOTE_OID"
+          else
+            # Remote main doesn't exist (or couldn't be read) -> explicit overwrite
+            git push hf HEAD:main --force
+          fi
