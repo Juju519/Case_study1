@@ -3,11 +3,10 @@ name: Run chatbot tests
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
-  # pull-requests is only needed if you later decide to comment on PRs
-  # pull-requests: write
 
 jobs:
   test:
@@ -33,7 +32,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # pin gradio to quiet the warning and keep CI stable
+          # pin gradio to keep CI stable/quiet
           pip install pytest transformers gradio==4.44.1 huggingface_hub
 
       - name: Run tests (no OAuth; local path stubbed)
@@ -62,6 +61,7 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     if: always()   # run even if tests fail
+
     steps:
       - name: Determine status
         id: status
@@ -130,8 +130,18 @@ jobs:
             core.setOutput("discord", JSON.stringify(discordPayload));
             core.setOutput("slack", JSON.stringify(slackPayload));
 
-      - name: Send Discord (if webhook set)
-        if: ${{ secrets.DISCORD_WEBHOOK_URL != '' }}
+      # ✅ Guard step: compute booleans without referencing `secrets` directly in `if:`
+      - name: Check webhooks
+        id: gates
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          SLACK_WEBHOOK_URL:   ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -n "$DISCORD_WEBHOOK_URL" ]; then echo "discord=true" >> $GITHUB_OUTPUT; else echo "discord=false" >> $GITHUB_OUTPUT; fi
+          if [ -n "$SLACK_WEBHOOK_URL" ];   then echo "slack=true"   >> $GITHUB_OUTPUT; else echo "slack=false"   >> $GITHUB_OUTPUT; fi
+
+      - name: Send Discord
+        if: steps.gates.outputs.discord == 'true'
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           PAYLOAD: ${{ steps.payloads.outputs.discord }}
@@ -141,8 +151,8 @@ jobs:
             --data "$PAYLOAD" \
             "$DISCORD_WEBHOOK_URL" || true
 
-      - name: Send Slack (if webhook set)
-        if: ${{ secrets.SLACK_WEBHOOK_URL != '' }}
+      - name: Send Slack
+        if: steps.gates.outputs.slack == 'true'
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           PAYLOAD: ${{ steps.payloads.outputs.slack }}
