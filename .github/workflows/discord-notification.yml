@@ -3,16 +3,72 @@ name: Discord Notification
 on:
   push:
     branches: [case_study_1_2025]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   notify:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Send Discord notification
-        env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }} # Make sure to set this Webhook URL in Github Secrets!
+      - name: Guard: ensure webhook is set
+        id: guard
         run: |
-          curl -X POST -H "Content-Type: application/json" \
-          -d "{\"content\": \"A new commit was pushed to the main branch by $GITHUB_ACTOR. :smile: Ponytails rock!\"}" \
-          $DISCORD_WEBHOOK_URL
+          if [ -z "${{ secrets.DISCORD_WEBHOOK_URL }}" ]; then
+            echo "Webhook secret DISCORD_WEBHOOK_URL is not set. Skipping."
+            echo "continue=false" >> $GITHUB_OUTPUT
+          else
+            echo "continue=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build rich Discord embed
+        if: steps.guard.outputs.continue == 'true'
+        id: payload
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const repo    = context.payload.repository.full_name;
+            const branch  = (context.ref || "").replace("refs/heads/", "") || context.payload.ref || "unknown";
+            const actor   = context.actor;
+            const sha     = context.sha || (context.payload.after ?? "");
+            const sha7    = sha ? sha.substring(0,7) : "unknown";
+            const head    = context.payload.head_commit || null;
+            const message = head?.message || (context.payload.commits?.length ? `${context.payload.commits.length} commits pushed` : "(no message)");
+            const compare = context.payload.compare || `https://github.com/${repo}/commit/${sha}`;
+
+            // Discord embed (colors: green=5763719, red=15548997, yellow=16776960, purple-ish=5814783)
+            const embed = {
+              title: `Push to ${branch}`,
+              url: compare,
+              description: `**${repo}**\n\`${sha7}\` by **${actor}**`,
+              color: 5814783,
+              fields: [
+                { name: "Branch",  value: branch, inline: true },
+                { name: "Actor",   value: actor,  inline: true },
+                { name: "Message", value: (message || "").slice(0, 1000) || "(empty)" }
+              ],
+              timestamp: new Date().toISOString()
+            };
+
+            const payload = {
+              username: "CI Bot",
+              // Set content to "@here" or "<@&ROLE_ID>" if you want a ping:
+              // content: null,
+              embeds: [embed]
+            };
+
+            core.setOutput("json", JSON.stringify(payload));
+
+      - name: Send Discord notification
+        if: steps.guard.outputs.continue == 'true'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          PAYLOAD: ${{ steps.payload.outputs.json }}
+        run: |
+          curl -sS -X POST \
+            -H "Content-Type: application/json" \
+            --retry 5 --retry-delay 2 \
+            -d "$PAYLOAD" \
+            "$DISCORD_WEBHOOK_URL"
