@@ -35,11 +35,14 @@ jobs:
           # pin gradio to keep CI stable/quiet
           pip install pytest transformers gradio==4.44.1 huggingface_hub
 
+
+
       - name: Run tests (no OAuth; local path stubbed)
         env:
-          SKIP_UI_ON_IMPORT: "1"            # prevents UI/OAuth from initializing during import
-          LOCAL_MODEL: sshleifer/tiny-gpt2  # keeps any fallback tiny/fast
+          SKIP_UI_ON_IMPORT: "1"
+          LOCAL_MODEL: sshleifer/tiny-gpt2
           GRADIO_ANALYTICS_ENABLED: "false"
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}   # 👈 ensure this line exists
         run: pytest -q
 
       # Redundant but nice: explicit UI smoke without OAuth for clear logs
