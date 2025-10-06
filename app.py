@@ -6,13 +6,16 @@ from typing import Optional
 import gradio as gr
 from huggingface_hub import InferenceClient
 
-pipe = None
+pipe = None           # global local pipeline
+tokenizer = None      # global local tokenizer
 
 # ========== Config ==========
-LOCAL_MODEL = os.environ.get("LOCAL_MODEL", "microsoft/Phi-3-mini-4k-instruct")
+# Use a SMALL, instruction-tuned chat model for local mode by default
+LOCAL_MODEL = os.environ.get("LOCAL_MODEL", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
 # Provider: "hf" | "nebius" | (fallback decided by keys below)
 API_PROVIDER = os.environ.get("API_PROVIDER", "").strip().lower()
+
 # HF model/task
 HF_MODEL_ID = os.environ.get("HF_MODEL_ID", os.environ.get("API_MODEL", "HuggingFaceH4/zephyr-7b-beta")).strip()
 HF_TASK = os.environ.get("HF_TASK", "").strip().lower()  # optional override: "conversational" | "text-generation"
@@ -20,7 +23,7 @@ HF_TOKEN = os.environ.get("HF_TOKEN")
 
 # Nebius
 NEBIUS_API_KEY = os.environ.get("NEBIUS_API_KEY")
-NEBIUS_MODEL = os.environ.get("NEBIUS_MODEL", "gpt-oss-20b")
+NEBIUS_MODEL = os.environ.get("NEBIUS_MODEL", "openai/gpt-oss-20b")
 NEBIUS_BASE_URL = os.environ.get("NEBIUS_BASE_URL", "https://api.studio.nebius.ai/v1")
 # ===========================
 
@@ -71,10 +74,37 @@ def _hf_task_for_model(model_id: str) -> str:
     """Pick the correct HF task: explicit env wins; else detect by model name."""
     if HF_TASK in ("conversational", "text-generation"):
         return HF_TASK
-    # Heuristic: Zephyr family is exposed as 'conversational' on HF Inference
     if "zephyr" in model_id.lower():
         return "conversational"
     return "text-generation"
+
+# -------- Local helpers (instruction-tuned formatting) --------
+def _build_local_prompt(msgs: list[dict[str, str]]) -> str:
+    """
+    Build a chat-style prompt for local models.
+    If the tokenizer has a chat template, use it; else fall back to a simple format.
+    """
+    global tokenizer
+    try:
+        if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
+            return tokenizer.apply_chat_template(
+                msgs, tokenize=False, add_generation_prompt=True
+            )
+    except Exception:
+        pass
+
+    # Fallback generic prompt
+    parts = []
+    for m in msgs:
+        role = m["role"]
+        if role == "system":
+            parts.append(f"System: {m['content']}")
+        elif role == "user":
+            parts.append(f"User: {m['content']}")
+        else:
+            parts.append(f"Assistant: {m['content']}")
+    parts.append("Assistant:")
+    return "\n".join(parts)
 
 # ---- Core chat handler ----
 def respond(
@@ -87,7 +117,7 @@ def respond(
     use_local_model: bool,
     hf_token: Optional[object] = None,
 ):
-    global pipe
+    global pipe, tokenizer
 
     fact = random.choice(WPI_FACTS)["text"]
     messages = [{"role": "system", "content": system_message}]
@@ -97,20 +127,46 @@ def respond(
     response = ""
 
     if use_local_model:
-        # Local transformers pipeline (kept simple & lazy)
-        from transformers import pipeline
-        if pipe is None:
-            pipe = pipeline("text-generation", model=LOCAL_MODEL)
-        prompt = "\n".join([f"{m['role']}: {m['content']}" for m in messages])
+        # Local transformers pipeline with chat-aware formatting
+        from transformers import pipeline, AutoTokenizer
+        import torch
+
+        # Keep CPU from thrashing; use any GPU if present
+        try:
+            torch.set_num_threads(2)
+        except Exception:
+            pass
+
+        if pipe is None or tokenizer is None:
+            # Lazy init
+            tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL, trust_remote_code=True)
+            pipe = pipeline(
+                "text-generation",
+                model=LOCAL_MODEL,
+                tokenizer=tokenizer,
+                device_map="auto",
+                trust_remote_code=True,
+            )
+
+        prompt = _build_local_prompt(messages)
+
+        # Generate once (non-stream) and yield the assistant part
         outputs = pipe(
             prompt,
-            max_new_tokens=max_tokens,
+            max_new_tokens=int(max_tokens),
             do_sample=True,
-            temperature=temperature,
-            top_p=top_p,
+            temperature=float(temperature),
+            top_p=float(top_p),
+            pad_token_id=tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
         )
-        response = outputs[0]["generated_text"][len(prompt):]
-        yield response.strip()
+
+        full = outputs[0]["generated_text"]
+        # If we used a chat template, slicing by prompt length is safe
+        assistant = full[len(prompt):].strip()
+        if "Assistant:" in assistant:
+            assistant = assistant.split("Assistant:", 1)[-1].strip()
+        yield assistant
         return
 
     provider = _resolve_provider()
@@ -120,15 +176,15 @@ def respond(
         if not NEBIUS_API_KEY:
             yield "⚠️ Missing NEBIUS_API_KEY. Set it or switch to HF by setting API_PROVIDER=hf and providing HF_TOKEN."
             return
-        # Using HF client with custom base for Nebius OpenAI-compatible chat
+        # Use HF client with custom base for Nebius OpenAI-compatible chat
         client = InferenceClient(token=NEBIUS_API_KEY, base_url=NEBIUS_BASE_URL)
         try:
             for chunk in client.chat_completion(  # type: ignore[attr-defined]
                 messages=messages,
-                max_tokens=max_tokens,
+                max_tokens=int(max_tokens),
                 stream=True,
-                temperature=temperature,
-                top_p=top_p,
+                temperature=float(temperature),
+                top_p=float(top_p),
                 model=NEBIUS_MODEL,
             ):
                 choices = getattr(chunk, "choices", [])
