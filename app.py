@@ -172,12 +172,12 @@ def respond(
         fact = random.choice(WPI_FACTS)["text"]
         messages = [{"role": "system", "content": system_message}]
         messages.extend(history)
-        messages.append({"role": "user", "content": f"{message}\n\nFun fact: {fact}"} )
+        messages.append({"role": "user", "content": f"{message}\n\nFun fact: {fact}"})
 
         response = ""
 
         if use_local_model:
-            # Local transformers pipeline with chat-aware formatting
+            # ---- LOCAL MODEL PATH ----
             from transformers import pipeline, AutoTokenizer
             import torch
 
@@ -197,7 +197,6 @@ def respond(
                 )
 
             prompt = _build_local_prompt(messages)
-
             outputs = pipe(
                 prompt,
                 max_new_tokens=int(max_tokens),
@@ -207,127 +206,61 @@ def respond(
                 pad_token_id=tokenizer.eos_token_id,
                 eos_token_id=tokenizer.eos_token_id,
             )
-
             full = outputs[0]["generated_text"]
             assistant = full[len(prompt):].strip()
             if "Assistant:" in assistant:
                 assistant = assistant.split("Assistant:", 1)[-1].strip()
 
-            token_estimate += max(0, len(assistant)) // 4  # rough heuristic
+            token_estimate += max(0, len(assistant)) // 4
             yield assistant
 
         else:
-                model_id = HF_MODEL_ID
-                print(f"[MODE] api | provider=hf model={model_id}")
-                token_value = _extract_hf_token(hf_token)
-                if not token_value:
-                    status = "error"
-                    yield "🔐 Please log in to Hugging Face or set HF_TOKEN to use the API path."
-                else:
-                    # Use HF router URL + text_generation (streaming)
-                    client = InferenceClient(model=_hf_model_url(model_id), token=token_value)
-                    prompt = _build_hf_chat_prompt(messages)
-                    try:
-                        stream = client.text_generation(
-                            prompt,
-                            max_new_tokens=int(max_tokens),
-                            temperature=float(temperature),
-                            top_p=float(top_p),
-                            stream=True,
-                            details=False,
-                            return_full_text=False,
-                        )
-                        for out in stream:
-                            try:
-                                token_text = getattr(out, "token", None)
-                                token_text = token_text.text if token_text else (out if isinstance(out, str) else "")
-                            except Exception:
-                                token_text = str(out) if out else ""
-                            response += token_text or ""
-                            token_estimate += max(0, len(token_text or "")) // 4
-                            yield response
-                    except Exception as e:
-                        status = "error"
-                        if "401" in str(e).lower() or "unauthorized" in str(e).lower():
-                            yield "⚠️ Hugging Face auth failed. Ensure HF_TOKEN is set (and accept model terms if required)."
-                        else:
-                            yield f"⚠️ HF Inference error: {e}"
-
+            # ---- HUGGING FACE API PATH ----
+            model_id = HF_MODEL_ID
+            print(f"[MODE] api | provider=hf model={model_id}")
+            token_value = _extract_hf_token(hf_token)
+            if not token_value:
+                status = "error"
+                yield "🔐 Please log in to Hugging Face or set HF_TOKEN to use the API path."
             else:
-                model_id = HF_MODEL_ID
-                print(f"[MODE] api | provider=hf model={model_id}")
-                token_value = _extract_hf_token(hf_token)
-                if not token_value:
+                client = InferenceClient(model=_hf_model_url(model_id), token=token_value)
+                prompt = _build_hf_chat_prompt(messages)
+                try:
+                    stream = client.text_generation(
+                        prompt,
+                        max_new_tokens=int(max_tokens),
+                        temperature=float(temperature),
+                        top_p=float(top_p),
+                        stream=True,
+                        details=False,
+                        return_full_text=False,
+                    )
+                    for out in stream:
+                        try:
+                            token_text = getattr(out, "token", None)
+                            token_text = token_text.text if token_text else (out if isinstance(out, str) else "")
+                        except Exception:
+                            token_text = str(out) if out else ""
+                        response += token_text or ""
+                        token_estimate += max(0, len(token_text or "")) // 4
+                        yield response
+                except Exception as e:
                     status = "error"
-                    yield "🔐 Please log in to Hugging Face or set HF_TOKEN to use the API path."
-                else:
-                    # NEW: always use router base_url (can be overridden via HF_BASE_URL env)
-                    client = InferenceClient(model=_hf_model_url(model_id), token=token_value)
-                    task = _hf_task_for_model(model_id)
-
-                    if task == "conversational":
-                        try:
-                            conv = client.conversational(  # type: ignore[attr-defined]
-                                input="\n".join([f"{m['role']}: {m['content']}" for m in messages]),
-                                parameters={
-                                    "max_new_tokens": int(max_tokens),
-                                    "temperature": float(temperature),
-                                    "top_p": float(top_p),
-                                },
-                            )
-                            text = getattr(conv, "generated_text", None)
-                            if text is None and isinstance(conv, dict):
-                                text = conv.get("generated_text", "")
-                            out = (text or "").strip()
-                            token_estimate += max(0, len(out)) // 4
-                            yield out
-                        except Exception as e:
-                            status = "error"
-                            if "not supported for task" in str(e).lower():
-                                yield f"⚠️ HF model '{model_id}' expects task 'conversational'. Set HF_TASK=conversational or choose a text-generation model."
-                            elif "401" in str(e) or "unauthorized" in str(e).lower():
-                                yield "⚠️ Hugging Face auth failed. Ensure HF_TOKEN is set or log in via the button."
-                            else:
-                                yield f"⚠️ HF Inference error (conversational): {e}"
+                    if "401" in str(e).lower() or "unauthorized" in str(e).lower():
+                        yield "⚠️ Hugging Face auth failed. Ensure HF_TOKEN is set (and accept model terms if required)."
                     else:
-                        prompt = "\n".join([f"{m['role']}: {m['content']}" for m in messages])
-                        try:
-                            stream = client.text_generation(
-                                prompt,
-                                max_new_tokens=int(max_tokens),
-                                temperature=float(temperature),
-                                top_p=float(top_p),
-                                stream=True,
-                                details=False,
-                                return_full_text=False,
-                            )
-                            for out in stream:
-                                try:
-                                    token_text = getattr(out, "token", None)
-                                    token_text = token_text.text if token_text else (out if isinstance(out, str) else "")
-                                except Exception:
-                                    token_text = str(out) if out else ""
-                                response += token_text or ""
-                                token_estimate += max(0, len(token_text or "")) // 4
-                                yield response
-                        except Exception as e:
-                            status = "error"
-                            if "not supported for task" in str(e).lower():
-                                yield f"⚠️ HF model '{model_id}' does not support text-generation. Try HF_TASK=conversational (e.g., for Zephyr) or switch HF_MODEL_ID."
-                            elif "401" in str(e) or "unauthorized" in str(e).lower():
-                                yield "⚠️ Hugging Face auth failed. Ensure HF_TOKEN or log in via the button."
-                            else:
-                                yield f"⚠️ HF Inference error: {e}"
+                        yield f"⚠️ HF Inference error: {e}"
 
     except Exception:
         status = "error"
         raise
     finally:
-        # Update metrics once per request
+        # ---- METRICS UPDATE ----
         REQS_TOTAL.labels(PRODUCT_KIND, status).inc()
         ACTIVE_SESSIONS.set(0 if not history else len(history))
         RESP_LATENCY.observe(time.time() - start_time)
         TOKENS_OUT.labels(PRODUCT_KIND).inc(token_estimate)
+
 
 def create_demo(enable_oauth: bool = True):
     with gr.Blocks(css=fancy_css) as demo:
