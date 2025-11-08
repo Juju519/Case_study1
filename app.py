@@ -71,6 +71,20 @@ except Exception:
 
 fancy_css = """/* fallback if your CSS file isn't ready */ #title { text-align:center; }"""
 
+def _build_hf_chat_prompt(messages: list[dict[str, str]]) -> str:
+    """Simple chat-style prompt for HF text_generation."""
+    parts = []
+    for m in messages:
+        role = m["role"]
+        if role == "system":
+            parts.append(f"System: {m['content']}")
+        elif role == "user":
+            parts.append(f"User: {m['content']}")
+        elif role == "assistant":
+            parts.append(f"Assistant: {m['content']}")
+    parts.append("Assistant:")
+    return "\n".join(parts)
+
 def _extract_hf_token(hf_token_obj: Optional[object]) -> Optional[str]:
     """Accepts LoginButton return, dict, or string; falls back to env HF_TOKEN."""
     if hf_token_obj:
@@ -203,37 +217,41 @@ def respond(
             yield assistant
 
         else:
-            provider = _resolve_provider()
-
-            if provider == "nebius":
-                print(f"[MODE] api | provider=nebius model={NEBIUS_MODEL}")
-                if not NEBIUS_API_KEY:
+                model_id = HF_MODEL_ID
+                print(f"[MODE] api | provider=hf model={model_id}")
+                token_value = _extract_hf_token(hf_token)
+                if not token_value:
                     status = "error"
-                    yield "⚠️ Missing NEBIUS_API_KEY. Set it or switch to HF by setting API_PROVIDER=hf and providing HF_TOKEN."
+                    yield "🔐 Please log in to Hugging Face or set HF_TOKEN to use the API path."
                 else:
-                    client = InferenceClient(token=NEBIUS_API_KEY, base_url=NEBIUS_BASE_URL)
+                    # Use HF router URL + text_generation (streaming)
+                    client = InferenceClient(model=_hf_model_url(model_id), token=token_value)
+                    prompt = _build_hf_chat_prompt(messages)
                     try:
-                        for chunk in client.chat_completion(  # type: ignore[attr-defined]
-                            messages=messages,
-                            max_tokens=int(max_tokens),
-                            stream=True,
+                        stream = client.text_generation(
+                            prompt,
+                            max_new_tokens=int(max_tokens),
                             temperature=float(temperature),
                             top_p=float(top_p),
-                            model=NEBIUS_MODEL,
-                        ):
-                            choices = getattr(chunk, "choices", [])
-                            token_text = ""
-                            if choices and getattr(choices[0].delta, "content", None):
-                                token_text = choices[0].delta.content
-                            response += token_text
-                            token_estimate += max(0, len(token_text)) // 4
+                            stream=True,
+                            details=False,
+                            return_full_text=False,
+                        )
+                        for out in stream:
+                            try:
+                                token_text = getattr(out, "token", None)
+                                token_text = token_text.text if token_text else (out if isinstance(out, str) else "")
+                            except Exception:
+                                token_text = str(out) if out else ""
+                            response += token_text or ""
+                            token_estimate += max(0, len(token_text or "")) // 4
                             yield response
                     except Exception as e:
                         status = "error"
-                        if "401" in str(e) or "Unauthorized" in str(e):
-                            yield "⚠️ Nebius auth failed. Check NEBIUS_API_KEY and NEBIUS_MODEL."
+                        if "401" in str(e).lower() or "unauthorized" in str(e).lower():
+                            yield "⚠️ Hugging Face auth failed. Ensure HF_TOKEN is set (and accept model terms if required)."
                         else:
-                            yield f"⚠️ Nebius API error: {e}"
+                            yield f"⚠️ HF Inference error: {e}"
 
             else:
                 model_id = HF_MODEL_ID
