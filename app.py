@@ -55,6 +55,9 @@ NEBIUS_MODEL = os.environ.get("NEBIUS_MODEL", "openai/gpt-oss-20b")
 NEBIUS_BASE_URL = os.environ.get("NEBIUS_BASE_URL", "https://api.studio.nebius.ai/v1")
 # ===========================
 
+def _hf_model_url(model_id: str) -> str:
+    return f"{HF_BASE_URL.rstrip('/')}/models/{model_id}"
+
 # Facts + CSS fallbacks
 FACTS_PATH = "facts.json"
 DEFAULT_FACTS = [{"text": "WPI was founded in 1865 by John Boynton and Ichabod Washburn."}]
@@ -241,7 +244,7 @@ def respond(
                     yield "🔐 Please log in to Hugging Face or set HF_TOKEN to use the API path."
                 else:
                     # NEW: always use router base_url (can be overridden via HF_BASE_URL env)
-                    client = InferenceClient(model=model_id, token=token_value, base_url=HF_BASE_URL)
+                    client = InferenceClient(model=_hf_model_url(model_id), token=token_value)
                     task = _hf_task_for_model(model_id)
 
                     if task == "conversational":
