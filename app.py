@@ -223,7 +223,7 @@ def respond(
                 status = "error"
                 yield "🔐 Please log in to Hugging Face or set HF_TOKEN to use the API path."
             else:
-                client = InferenceClient(model=_hf_model_url(model_id), token=token_value)
+                client = InferenceClient(token=token_value, base_url=_hf_model_url(model_id))
                 prompt = _build_hf_chat_prompt(messages)
                 try:
                     stream = client.text_generation(
