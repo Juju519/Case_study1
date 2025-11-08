@@ -47,6 +47,8 @@ API_PROVIDER = os.environ.get("API_PROVIDER", "").strip().lower()
 HF_MODEL_ID = os.environ.get("HF_MODEL_ID", os.environ.get("API_MODEL", "HuggingFaceH4/zephyr-7b-beta")).strip()
 HF_TASK = os.environ.get("HF_TASK", "").strip().lower()
 HF_TOKEN = os.environ.get("HF_TOKEN")
+# NEW: default to HF router endpoint to avoid 410 Gone on api-inference
+HF_BASE_URL = os.environ.get("HF_BASE_URL", "https://router.huggingface.co/hf-inference")
 
 NEBIUS_API_KEY = os.environ.get("NEBIUS_API_KEY")
 NEBIUS_MODEL = os.environ.get("NEBIUS_MODEL", "openai/gpt-oss-20b")
@@ -238,7 +240,8 @@ def respond(
                     status = "error"
                     yield "🔐 Please log in to Hugging Face or set HF_TOKEN to use the API path."
                 else:
-                    client = InferenceClient(model=model_id, token=token_value)
+                    # NEW: always use router base_url (can be overridden via HF_BASE_URL env)
+                    client = InferenceClient(model=model_id, token=token_value, base_url=HF_BASE_URL)
                     task = _hf_task_for_model(model_id)
 
                     if task == "conversational":
