@@ -1,27 +1,53 @@
 import os
 import json
 import random
+import time
 from typing import Optional
 
 import gradio as gr
 from huggingface_hub import InferenceClient
 
+# --- Prometheus app metrics (port :8000) ---
+from prometheus_client import start_http_server, Counter, Histogram, Gauge, Info
+
+PRODUCT_KIND = os.getenv("PRODUCT_KIND", "unknown")  # "local" | "api" (set per container)
+
+REQS_TOTAL = Counter(
+    "gompei_requests_total",
+    "Total chat requests processed",
+    ["product", "status"],
+)
+RESP_LATENCY = Histogram(
+    "gompei_response_latency_seconds",
+    "End-to-end response latency (seconds)",
+    buckets=(0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20),
+)
+ACTIVE_SESSIONS = Gauge(
+    "gompei_active_sessions",
+    "Active chat sessions (len(history) proxy)",
+)
+TOKENS_OUT = Counter(
+    "gompei_tokens_emitted_total",
+    "Approx tokens emitted (len of chunks / 4 heuristic)",
+    ["product"],
+)
+BUILD_INFO = Info(
+    "gompei_build_info",
+    "Build/provider/model info for this instance",
+)
+
 pipe = None           # global local pipeline
 tokenizer = None      # global local tokenizer
 
 # ========== Config ==========
-# Use a SMALL, instruction-tuned chat model for local mode by default
 LOCAL_MODEL = os.environ.get("LOCAL_MODEL", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
-# Provider: "hf" | "nebius" | (fallback decided by keys below)
 API_PROVIDER = os.environ.get("API_PROVIDER", "").strip().lower()
 
-# HF model/task
 HF_MODEL_ID = os.environ.get("HF_MODEL_ID", os.environ.get("API_MODEL", "HuggingFaceH4/zephyr-7b-beta")).strip()
-HF_TASK = os.environ.get("HF_TASK", "").strip().lower()  # optional override: "conversational" | "text-generation"
+HF_TASK = os.environ.get("HF_TASK", "").strip().lower()
 HF_TOKEN = os.environ.get("HF_TOKEN")
 
-# Nebius
 NEBIUS_API_KEY = os.environ.get("NEBIUS_API_KEY")
 NEBIUS_MODEL = os.environ.get("NEBIUS_MODEL", "openai/gpt-oss-20b")
 NEBIUS_BASE_URL = os.environ.get("NEBIUS_BASE_URL", "https://api.studio.nebius.ai/v1")
@@ -119,151 +145,166 @@ def respond(
 ):
     global pipe, tokenizer
 
-    fact = random.choice(WPI_FACTS)["text"]
-    messages = [{"role": "system", "content": system_message}]
-    messages.extend(history)
-    messages.append({"role": "user", "content": f"{message}\n\nFun fact: {fact}"} )
+    start_time = time.time()
+    token_estimate = 0
+    status = "ok"
 
-    response = ""
+    try:
+        fact = random.choice(WPI_FACTS)["text"]
+        messages = [{"role": "system", "content": system_message}]
+        messages.extend(history)
+        messages.append({"role": "user", "content": f"{message}\n\nFun fact: {fact}"} )
 
-    if use_local_model:
-        # Local transformers pipeline with chat-aware formatting
-        from transformers import pipeline, AutoTokenizer
-        import torch
+        response = ""
 
-        # Keep CPU from thrashing; use any GPU if present
-        try:
-            torch.set_num_threads(2)
-        except Exception:
-            pass
+        if use_local_model:
+            # Local transformers pipeline with chat-aware formatting
+            from transformers import pipeline, AutoTokenizer
+            import torch
 
-        if pipe is None or tokenizer is None:
-            # Lazy init
-            tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL, trust_remote_code=True)
-            pipe = pipeline(
-                "text-generation",
-                model=LOCAL_MODEL,
-                tokenizer=tokenizer,
-                device_map="auto",
-                trust_remote_code=True,
-            )
+            try:
+                torch.set_num_threads(2)
+            except Exception:
+                pass
 
-        prompt = _build_local_prompt(messages)
+            if pipe is None or tokenizer is None:
+                tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL, trust_remote_code=True)
+                pipe = pipeline(
+                    "text-generation",
+                    model=LOCAL_MODEL,
+                    tokenizer=tokenizer,
+                    device_map="auto",
+                    trust_remote_code=True,
+                )
 
-        # Generate once (non-stream) and yield the assistant part
-        outputs = pipe(
-            prompt,
-            max_new_tokens=int(max_tokens),
-            do_sample=True,
-            temperature=float(temperature),
-            top_p=float(top_p),
-            pad_token_id=tokenizer.eos_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-        )
+            prompt = _build_local_prompt(messages)
 
-        full = outputs[0]["generated_text"]
-        # If we used a chat template, slicing by prompt length is safe
-        assistant = full[len(prompt):].strip()
-        if "Assistant:" in assistant:
-            assistant = assistant.split("Assistant:", 1)[-1].strip()
-        yield assistant
-        return
-
-    provider = _resolve_provider()
-
-    if provider == "nebius":
-        print(f"[MODE] api | provider=nebius model={NEBIUS_MODEL}")
-        if not NEBIUS_API_KEY:
-            yield "⚠️ Missing NEBIUS_API_KEY. Set it or switch to HF by setting API_PROVIDER=hf and providing HF_TOKEN."
-            return
-        # Use HF client with custom base for Nebius OpenAI-compatible chat
-        client = InferenceClient(token=NEBIUS_API_KEY, base_url=NEBIUS_BASE_URL)
-        try:
-            for chunk in client.chat_completion(  # type: ignore[attr-defined]
-                messages=messages,
-                max_tokens=int(max_tokens),
-                stream=True,
-                temperature=float(temperature),
-                top_p=float(top_p),
-                model=NEBIUS_MODEL,
-            ):
-                choices = getattr(chunk, "choices", [])
-                token_text = ""
-                if choices and getattr(choices[0].delta, "content", None):
-                    token_text = choices[0].delta.content
-                response += token_text
-                yield response
-        except Exception as e:
-            if "401" in str(e) or "Unauthorized" in str(e):
-                yield "⚠️ Nebius auth failed. Check NEBIUS_API_KEY and NEBIUS_MODEL."
-            else:
-                yield f"⚠️ Nebius API error: {e}"
-        return
-
-    # HF provider
-    model_id = HF_MODEL_ID
-    print(f"[MODE] api | provider=hf model={model_id}")
-    token_value = _extract_hf_token(hf_token)
-    if not token_value:
-        yield "🔐 Please log in to Hugging Face or set HF_TOKEN to use the API path."
-        return
-
-    client = InferenceClient(model=model_id, token=token_value)
-    task = _hf_task_for_model(model_id)
-
-    if task == "conversational":
-        # Non-streaming conversational call (Zephyr etc.)
-        try:
-            conv = client.conversational(  # type: ignore[attr-defined]
-                input="\n".join([f"{m['role']}: {m['content']}" for m in messages]),
-                parameters={
-                    "max_new_tokens": int(max_tokens),
-                    "temperature": float(temperature),
-                    "top_p": float(top_p),
-                },
-            )
-            text = getattr(conv, "generated_text", None)
-            if text is None and isinstance(conv, dict):
-                text = conv.get("generated_text", "")
-            yield (text or "").strip()
-        except Exception as e:
-            if "not supported for task" in str(e).lower():
-                yield f"⚠️ HF model '{model_id}' expects task 'conversational'. Set HF_TASK=conversational or choose a text-generation model."
-            elif "401" in str(e) or "unauthorized" in str(e).lower():
-                yield "⚠️ Hugging Face auth failed. Ensure HF_TOKEN is set or log in via the button."
-            else:
-                yield f"⚠️ HF Inference error (conversational): {e}"
-        return
-    else:
-        # Streaming text-generation path
-        prompt = "\n".join([f"{m['role']}: {m['content']}" for m in messages])
-        try:
-            stream = client.text_generation(
+            outputs = pipe(
                 prompt,
                 max_new_tokens=int(max_tokens),
+                do_sample=True,
                 temperature=float(temperature),
                 top_p=float(top_p),
-                stream=True,
-                details=False,
-                return_full_text=False,
+                pad_token_id=tokenizer.eos_token_id,
+                eos_token_id=tokenizer.eos_token_id,
             )
-            for out in stream:
-                try:
-                    token_text = getattr(out, "token", None)
-                    token_text = token_text.text if token_text else (out if isinstance(out, str) else "")
-                except Exception:
-                    token_text = str(out) if out else ""
-                response += token_text
-                yield response
-        except Exception as e:
-            if "not supported for task" in str(e).lower():
-                yield f"⚠️ HF model '{model_id}' does not support text-generation. Try HF_TASK=conversational (e.g., for Zephyr) or switch HF_MODEL_ID."
-            elif "401" in str(e) or "unauthorized" in str(e).lower():
-                yield "⚠️ Hugging Face auth failed. Ensure HF_TOKEN or log in via the button."
-            else:
-                yield f"⚠️ HF Inference error: {e}"
 
-# ---- Build UI only when asked ----
+            full = outputs[0]["generated_text"]
+            assistant = full[len(prompt):].strip()
+            if "Assistant:" in assistant:
+                assistant = assistant.split("Assistant:", 1)[-1].strip()
+
+            token_estimate += max(0, len(assistant)) // 4  # rough heuristic
+            yield assistant
+
+        else:
+            provider = _resolve_provider()
+
+            if provider == "nebius":
+                print(f"[MODE] api | provider=nebius model={NEBIUS_MODEL}")
+                if not NEBIUS_API_KEY:
+                    status = "error"
+                    yield "⚠️ Missing NEBIUS_API_KEY. Set it or switch to HF by setting API_PROVIDER=hf and providing HF_TOKEN."
+                else:
+                    client = InferenceClient(token=NEBIUS_API_KEY, base_url=NEBIUS_BASE_URL)
+                    try:
+                        for chunk in client.chat_completion(  # type: ignore[attr-defined]
+                            messages=messages,
+                            max_tokens=int(max_tokens),
+                            stream=True,
+                            temperature=float(temperature),
+                            top_p=float(top_p),
+                            model=NEBIUS_MODEL,
+                        ):
+                            choices = getattr(chunk, "choices", [])
+                            token_text = ""
+                            if choices and getattr(choices[0].delta, "content", None):
+                                token_text = choices[0].delta.content
+                            response += token_text
+                            token_estimate += max(0, len(token_text)) // 4
+                            yield response
+                    except Exception as e:
+                        status = "error"
+                        if "401" in str(e) or "Unauthorized" in str(e):
+                            yield "⚠️ Nebius auth failed. Check NEBIUS_API_KEY and NEBIUS_MODEL."
+                        else:
+                            yield f"⚠️ Nebius API error: {e}"
+
+            else:
+                model_id = HF_MODEL_ID
+                print(f"[MODE] api | provider=hf model={model_id}")
+                token_value = _extract_hf_token(hf_token)
+                if not token_value:
+                    status = "error"
+                    yield "🔐 Please log in to Hugging Face or set HF_TOKEN to use the API path."
+                else:
+                    client = InferenceClient(model=model_id, token=token_value)
+                    task = _hf_task_for_model(model_id)
+
+                    if task == "conversational":
+                        try:
+                            conv = client.conversational(  # type: ignore[attr-defined]
+                                input="\n".join([f"{m['role']}: {m['content']}" for m in messages]),
+                                parameters={
+                                    "max_new_tokens": int(max_tokens),
+                                    "temperature": float(temperature),
+                                    "top_p": float(top_p),
+                                },
+                            )
+                            text = getattr(conv, "generated_text", None)
+                            if text is None and isinstance(conv, dict):
+                                text = conv.get("generated_text", "")
+                            out = (text or "").strip()
+                            token_estimate += max(0, len(out)) // 4
+                            yield out
+                        except Exception as e:
+                            status = "error"
+                            if "not supported for task" in str(e).lower():
+                                yield f"⚠️ HF model '{model_id}' expects task 'conversational'. Set HF_TASK=conversational or choose a text-generation model."
+                            elif "401" in str(e) or "unauthorized" in str(e).lower():
+                                yield "⚠️ Hugging Face auth failed. Ensure HF_TOKEN is set or log in via the button."
+                            else:
+                                yield f"⚠️ HF Inference error (conversational): {e}"
+                    else:
+                        prompt = "\n".join([f"{m['role']}: {m['content']}" for m in messages])
+                        try:
+                            stream = client.text_generation(
+                                prompt,
+                                max_new_tokens=int(max_tokens),
+                                temperature=float(temperature),
+                                top_p=float(top_p),
+                                stream=True,
+                                details=False,
+                                return_full_text=False,
+                            )
+                            for out in stream:
+                                try:
+                                    token_text = getattr(out, "token", None)
+                                    token_text = token_text.text if token_text else (out if isinstance(out, str) else "")
+                                except Exception:
+                                    token_text = str(out) if out else ""
+                                response += token_text or ""
+                                token_estimate += max(0, len(token_text or "")) // 4
+                                yield response
+                        except Exception as e:
+                            status = "error"
+                            if "not supported for task" in str(e).lower():
+                                yield f"⚠️ HF model '{model_id}' does not support text-generation. Try HF_TASK=conversational (e.g., for Zephyr) or switch HF_MODEL_ID."
+                            elif "401" in str(e) or "unauthorized" in str(e).lower():
+                                yield "⚠️ Hugging Face auth failed. Ensure HF_TOKEN or log in via the button."
+                            else:
+                                yield f"⚠️ HF Inference error: {e}"
+
+    except Exception:
+        status = "error"
+        raise
+    finally:
+        # Update metrics once per request
+        REQS_TOTAL.labels(PRODUCT_KIND, status).inc()
+        ACTIVE_SESSIONS.set(0 if not history else len(history))
+        RESP_LATENCY.observe(time.time() - start_time)
+        TOKENS_OUT.labels(PRODUCT_KIND).inc(token_estimate)
+
 def create_demo(enable_oauth: bool = True):
     with gr.Blocks(css=fancy_css) as demo:
         with gr.Row():
@@ -281,7 +322,7 @@ def create_demo(enable_oauth: bool = True):
                 gr.Slider(minimum=0.1, maximum=2.0, value=0.7, step=0.1, label="Temperature"),
                 gr.Slider(minimum=0.1, maximum=1.0, value=0.95, step=0.05, label="Top-p (nucleus sampling)"),
                 gr.Checkbox(label="Use Local Model", value=False),
-                token_input,  # LoginButton or dummy State(None) to keep signature aligned
+                token_input,
             ],
             type="messages",
             examples=[
@@ -305,9 +346,21 @@ if os.environ.get("SKIP_UI_ON_IMPORT") != "1":
     demo = create_demo(enable_oauth=_enable_oauth)
 
 if __name__ == "__main__":
+    # Start Prometheus metrics server on :8000 before launching UI
+    start_http_server(8000)
+    BUILD_INFO.info({
+        "version": "cs3",
+        "provider": os.getenv("API_PROVIDER", "local"),
+        "local_model": os.getenv("LOCAL_MODEL", ""),
+        "hf_model_id": os.getenv("HF_MODEL_ID", ""),
+        "nebius_model": os.getenv("NEBIUS_MODEL", ""),
+        "product": PRODUCT_KIND,
+    })
+
     if "demo" not in globals():
         _enable_oauth = os.getenv("ENABLE_OAUTH", "0").lower() not in ("0", "false", "no")
         demo = create_demo(enable_oauth=_enable_oauth)
+
     demo.queue().launch(
         server_name=os.getenv("GRADIO_SERVER_NAME", "0.0.0.0"),
         server_port=int(os.getenv("GRADIO_SERVER_PORT", "7860")),
