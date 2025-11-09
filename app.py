@@ -11,6 +11,7 @@ from huggingface_hub import InferenceClient
 from prometheus_client import start_http_server, Counter, Histogram, Gauge, Info
 
 PRODUCT_KIND = os.getenv("PRODUCT_KIND", "unknown")  # "local" | "api" (set per container)
+HF_BASE_URL = os.environ.get("HF_BASE_URL", "https://router.huggingface.co")
 
 REQS_TOTAL = Counter(
     "gompei_requests_total",
@@ -215,19 +216,25 @@ def respond(
             yield assistant
 
         else:
-            # ---- HUGGING FACE API PATH ----
+            # ---- HUGGING FACE API PATH (router) ----
             model_id = HF_MODEL_ID
             print(f"[MODE] api | provider=hf model={model_id}")
-            token_value = _extract_hf_token(hf_token)
+
+            # Always read token from ENV to avoid UI login confusion
+            token_value = os.getenv("HF_TOKEN", "").strip()
             if not token_value:
                 status = "error"
                 yield "🔐 Please log in to Hugging Face or set HF_TOKEN to use the API path."
             else:
-                client = InferenceClient(token=token_value, base_url=_hf_model_url(model_id))
+                # Create client pointed at router root
+                client = InferenceClient(token=token_value, base_url=HF_BASE_URL)
+
+                # Build a simple chat prompt and stream via text_generation
                 prompt = _build_hf_chat_prompt(messages)
                 try:
                     stream = client.text_generation(
                         prompt,
+                        model=model_id,   # pass model per request
                         max_new_tokens=int(max_tokens),
                         temperature=float(temperature),
                         top_p=float(top_p),
@@ -235,6 +242,8 @@ def respond(
                         details=False,
                         return_full_text=False,
                     )
+                    response = ""
+                    token_estimate = 0
                     for out in stream:
                         try:
                             token_text = getattr(out, "token", None)
@@ -248,8 +257,13 @@ def respond(
                     status = "error"
                     if "401" in str(e).lower() or "unauthorized" in str(e).lower():
                         yield "⚠️ Hugging Face auth failed. Ensure HF_TOKEN is set (and accept model terms if required)."
+                    elif "404" in str(e):
+                        yield ("⚠️ Model not found at the router. "
+                               "Double-check HF_MODEL_ID or try a public model like "
+                               "`mistralai/Mistral-7B-Instruct-v0.3` or `microsoft/Phi-3-mini-4k-instruct`.")
                     else:
                         yield f"⚠️ HF Inference error: {e}"
+
 
     except Exception:
         status = "error"
