@@ -10,6 +10,9 @@ from huggingface_hub import InferenceClient
 # --- Prometheus app metrics (port :8000) ---
 from prometheus_client import start_http_server, Counter, Histogram, Gauge, Info
 
+print("[CS3] STARTUP app.py using requests-based HF Router path")
+
+
 PRODUCT_KIND = os.getenv("PRODUCT_KIND", "unknown")  # "local" | "api" (set per container)
 HF_BASE_URL = os.environ.get("HF_BASE_URL", "https://router.huggingface.co")
 
@@ -53,8 +56,13 @@ HF_BASE_URL = os.environ.get("HF_BASE_URL", "https://router.huggingface.co/hf-in
 
 NEBIUS_API_KEY = os.environ.get("NEBIUS_API_KEY")
 NEBIUS_MODEL = os.environ.get("NEBIUS_MODEL", "openai/gpt-oss-20b")
-NEBIUS_BASE_URL = os.environ.get("NEBIUS_BASE_URL", "https://api.studio.nebius.ai/v1")
+HF_BASE_URL = os.environ.get("HF_BASE_URL", "https://router.huggingface.co")
+print("[CS3] Router base:", HF_BASE_URL)
+print("[CS3] Model id:", os.environ.get("HF_MODEL_ID"))
+
 # ===========================
+
+
 
 def _hf_model_url(model_id: str) -> str:
     return f"{HF_BASE_URL.rstrip('/')}/models/{model_id}"
@@ -216,53 +224,55 @@ def respond(
             yield assistant
 
         else:
-            # ---- HUGGING FACE API PATH (router) ----
+            # ---- HUGGING FACE API PATH via Router (OpenAI-compatible) ----
             model_id = HF_MODEL_ID
-            print(f"[MODE] api | provider=hf model={model_id}")
-
-            # Always read token from ENV to avoid UI login confusion
             token_value = os.getenv("HF_TOKEN", "").strip()
             if not token_value:
                 status = "error"
                 yield "🔐 Please log in to Hugging Face or set HF_TOKEN to use the API path."
             else:
-                # Create client pointed at router root
-                client = InferenceClient(token=token_value, base_url=HF_BASE_URL)
-
-                # Build a simple chat prompt and stream via text_generation
                 prompt = _build_hf_chat_prompt(messages)
+
+                url = f"{HF_BASE_URL.rstrip('/')}/v1/completions"
+                headers = {"Authorization": f"Bearer {token_value}"}
+                payload = {
+                    "model": model_id,
+                    "prompt": prompt,
+                    "max_tokens": int(max_tokens),
+                    "temperature": float(temperature),
+                    "top_p": float(top_p)
+                }
                 try:
-                    stream = client.text_generation(
-                        prompt,
-                        model=model_id,   # pass model per request
-                        max_new_tokens=int(max_tokens),
-                        temperature=float(temperature),
-                        top_p=float(top_p),
-                        stream=True,
-                        details=False,
-                        return_full_text=False,
-                    )
-                    response = ""
-                    token_estimate = 0
-                    for out in stream:
+                    t0 = time.time()
+                    import requests
+                    r = requests.post(url, headers=headers, json=payload, timeout=120)
+                    if r.status_code == 401:
+                        status = "error"
+                        yield "⚠️ Hugging Face auth failed (401). Ensure HF_TOKEN is valid and model terms are accepted."
+                    elif r.status_code == 404:
+                        status = "error"
+                        yield ("⚠️ Model not found at the router (404). "
+                               "Double-check HF_MODEL_ID or try `mistralai/Mistral-7B-Instruct-v0.3`.")
+                    elif r.status_code >= 400:
+                        status = "error"
+                        yield f"⚠️ HF Router error {r.status_code}: {r.text[:300]}"
+                    else:
+                        data = r.json()
+                        text = ""
                         try:
-                            token_text = getattr(out, "token", None)
-                            token_text = token_text.text if token_text else (out if isinstance(out, str) else "")
+                            text = data["choices"][0].get("text") or ""
                         except Exception:
-                            token_text = str(out) if out else ""
-                        response += token_text or ""
-                        token_estimate += max(0, len(token_text or "")) // 4
-                        yield response
+                            text = str(data)[:500]
+                        RESP_LATENCY.observe(time.time() - t0)
+                        TOKENS_OUT.labels(PRODUCT_KIND).inc(max(0, len(text)) // 4)
+                        yield text
+                except requests.Timeout:
+                    status = "error"
+                    yield "⚠️ HF Router timeout. Try again or lower max tokens."
                 except Exception as e:
                     status = "error"
-                    if "401" in str(e).lower() or "unauthorized" in str(e).lower():
-                        yield "⚠️ Hugging Face auth failed. Ensure HF_TOKEN is set (and accept model terms if required)."
-                    elif "404" in str(e):
-                        yield ("⚠️ Model not found at the router. "
-                               "Double-check HF_MODEL_ID or try a public model like "
-                               "`mistralai/Mistral-7B-Instruct-v0.3` or `microsoft/Phi-3-mini-4k-instruct`.")
-                    else:
-                        yield f"⚠️ HF Inference error: {e}"
+                    yield f"⚠️ HF request failed: {e}"
+
 
 
     except Exception:
