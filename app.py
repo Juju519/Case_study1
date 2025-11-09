@@ -1,73 +1,47 @@
-import os
-import json
-import random
-import time
+# app.py
+import os, json, random, time
 from typing import Optional
 
 import gradio as gr
-from huggingface_hub import InferenceClient
+import requests
 
 # --- Prometheus app metrics (port :8000) ---
 from prometheus_client import start_http_server, Counter, Histogram, Gauge, Info
 
-print("[CS3] STARTUP app.py using requests-based HF Router path")
+print("[CS3] STARTUP (requests-based API path)")
 
+# ========== Config ==========
+PRODUCT_KIND   = os.getenv("PRODUCT_KIND", "unknown")  # "local" | "api" (set per container)
 
-PRODUCT_KIND = os.getenv("PRODUCT_KIND", "unknown")  # "local" | "api" (set per container)
-HF_BASE_URL = os.environ.get("HF_BASE_URL", "https://router.huggingface.co")
+# Local model (only used when the UI checkbox "Use Local Model" is on)
+LOCAL_MODEL    = os.getenv("LOCAL_MODEL", "sshleifer/tiny-gpt2").strip()
 
-REQS_TOTAL = Counter(
-    "gompei_requests_total",
-    "Total chat requests processed",
-    ["product", "status"],
-)
+# OpenAI-compatible provider (preferred if key is present)
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "").strip()  # e.g., https://openrouter.ai/api or https://api.together.xyz
+OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY", "").strip()
+
+# Hugging Face Router fallback (if no OpenAI key)
+HF_BASE_URL    = os.getenv("HF_BASE_URL", "https://router.huggingface.co").strip()
+HF_MODEL_ID    = os.getenv("HF_MODEL_ID", "google/gemma-2-2b-it").strip()
+HF_TOKEN       = os.getenv("HF_TOKEN", "").strip()
+
+print(f"[CS3] PRODUCT_KIND={PRODUCT_KIND}")
+print(f"[CS3] OPENAI_BASE_URL={'<set>' if OPENAI_BASE_URL else '<empty>'}")
+print(f"[CS3] HF_BASE_URL={HF_BASE_URL}")
+print(f"[CS3] HF_MODEL_ID={HF_MODEL_ID}")
+
+# ========== Metrics ==========
+REQS_TOTAL = Counter("gompei_requests_total", "Total chat requests processed", ["product", "status"])
 RESP_LATENCY = Histogram(
     "gompei_response_latency_seconds",
     "End-to-end response latency (seconds)",
     buckets=(0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20),
 )
-ACTIVE_SESSIONS = Gauge(
-    "gompei_active_sessions",
-    "Active chat sessions (len(history) proxy)",
-)
-TOKENS_OUT = Counter(
-    "gompei_tokens_emitted_total",
-    "Approx tokens emitted (len of chunks / 4 heuristic)",
-    ["product"],
-)
-BUILD_INFO = Info(
-    "gompei_build_info",
-    "Build/provider/model info for this instance",
-)
+ACTIVE_SESSIONS = Gauge("gompei_active_sessions", "Active chat sessions (len(history) proxy)")
+TOKENS_OUT = Counter("gompei_tokens_emitted_total", "Approx tokens emitted (chars/4 heuristic)", ["product"])
+BUILD_INFO = Info("gompei_build_info", "Build/provider/model info for this instance")
 
-pipe = None           # global local pipeline
-tokenizer = None      # global local tokenizer
-
-# ========== Config ==========
-LOCAL_MODEL = os.environ.get("LOCAL_MODEL", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-
-API_PROVIDER = os.environ.get("API_PROVIDER", "").strip().lower()
-
-HF_MODEL_ID = os.environ.get("HF_MODEL_ID", os.environ.get("API_MODEL", "HuggingFaceH4/zephyr-7b-beta")).strip()
-HF_TASK = os.environ.get("HF_TASK", "").strip().lower()
-HF_TOKEN = os.environ.get("HF_TOKEN")
-# NEW: default to HF router endpoint to avoid 410 Gone on api-inference
-HF_BASE_URL = os.environ.get("HF_BASE_URL", "https://router.huggingface.co/hf-inference")
-
-NEBIUS_API_KEY = os.environ.get("NEBIUS_API_KEY")
-NEBIUS_MODEL = os.environ.get("NEBIUS_MODEL", "openai/gpt-oss-20b")
-HF_BASE_URL = os.environ.get("HF_BASE_URL", "https://router.huggingface.co")
-print("[CS3] Router base:", HF_BASE_URL)
-print("[CS3] Model id:", os.environ.get("HF_MODEL_ID"))
-
-# ===========================
-
-
-
-def _hf_model_url(model_id: str) -> str:
-    return f"{HF_BASE_URL.rstrip('/')}/models/{model_id}"
-
-# Facts + CSS fallbacks
+# ========== Facts + CSS ==========
 FACTS_PATH = "facts.json"
 DEFAULT_FACTS = [{"text": "WPI was founded in 1865 by John Boynton and Ichabod Washburn."}]
 try:
@@ -78,89 +52,48 @@ try:
 except Exception:
     WPI_FACTS = DEFAULT_FACTS
 
-fancy_css = """/* fallback if your CSS file isn't ready */ #title { text-align:center; }"""
+fancy_css = "#title { text-align:center; }"
 
-def _build_hf_chat_prompt(messages: list[dict[str, str]]) -> str:
-    """Simple chat-style prompt for HF text_generation."""
-    parts = []
-    for m in messages:
-        role = m["role"]
-        if role == "system":
-            parts.append(f"System: {m['content']}")
-        elif role == "user":
-            parts.append(f"User: {m['content']}")
-        elif role == "assistant":
-            parts.append(f"Assistant: {m['content']}")
-    parts.append("Assistant:")
-    return "\n".join(parts)
-
-def _extract_hf_token(hf_token_obj: Optional[object]) -> Optional[str]:
-    """Accepts LoginButton return, dict, or string; falls back to env HF_TOKEN."""
-    if hf_token_obj:
-        if isinstance(hf_token_obj, str) and hf_token_obj.strip():
-            return hf_token_obj.strip()
-        for attr in ("token", "access_token"):
-            try:
-                val = getattr(hf_token_obj, attr, None)
-                if isinstance(val, str) and val.strip():
-                    return val.strip()
-            except Exception:
-                pass
-        try:
-            if hasattr(hf_token_obj, "get"):
-                val = hf_token_obj.get("token") or hf_token_obj.get("access_token")
-                if isinstance(val, str) and val.strip():
-                    return val.strip()
-        except Exception:
-            pass
-    env_val = os.environ.get("HF_TOKEN")
-    if isinstance(env_val, str) and env_val.strip():
-        return env_val.strip()
-    return None
-
-def _resolve_provider() -> str:
-    """Choose provider if not explicitly set."""
-    if API_PROVIDER in ("hf", "nebius"):
-        return API_PROVIDER
-    return "nebius" if NEBIUS_API_KEY else "hf"
-
-def _hf_task_for_model(model_id: str) -> str:
-    """Pick the correct HF task: explicit env wins; else detect by model name."""
-    if HF_TASK in ("conversational", "text-generation"):
-        return HF_TASK
-    if "zephyr" in model_id.lower():
-        return "conversational"
-    return "text-generation"
-
-# -------- Local helpers (instruction-tuned formatting) --------
+# -------- Helpers --------
 def _build_local_prompt(msgs: list[dict[str, str]]) -> str:
-    """
-    Build a chat-style prompt for local models.
-    If the tokenizer has a chat template, use it; else fall back to a simple format.
-    """
-    global tokenizer
-    try:
-        if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
-            return tokenizer.apply_chat_template(
-                msgs, tokenize=False, add_generation_prompt=True
-            )
-    except Exception:
-        pass
-
-    # Fallback generic prompt
+    """Simple chat-ish prompt for local text-generation."""
     parts = []
     for m in msgs:
-        role = m["role"]
-        if role == "system":
+        r = m["role"]
+        if r == "system":
             parts.append(f"System: {m['content']}")
-        elif role == "user":
+        elif r == "user":
             parts.append(f"User: {m['content']}")
         else:
             parts.append(f"Assistant: {m['content']}")
     parts.append("Assistant:")
     return "\n".join(parts)
 
+def _build_chat_messages(system_message: str, history: list[dict[str, str]], user_text: str):
+    """Build OpenAI-style chat messages."""
+    msgs = [{"role": "system", "content": system_message}]
+    msgs.extend(history or [])
+    msgs.append({"role": "user", "content": user_text})
+    return msgs
+
+def _build_hf_chat_prompt(msgs: list[dict[str, str]]) -> str:
+    """Simple chat-style prompt for HF /v1/completions."""
+    parts = []
+    for m in msgs:
+        r = m["role"]
+        if r == "system":
+            parts.append(f"System: {m['content']}")
+        elif r == "user":
+            parts.append(f"User: {m['content']}")
+        elif r == "assistant":
+            parts.append(f"Assistant: {m['content']}")
+    parts.append("Assistant:")
+    return "\n".join(parts)
+
 # ---- Core chat handler ----
+pipe = None
+tokenizer = None
+
 def respond(
     message,
     history: list[dict[str, str]],
@@ -169,7 +102,7 @@ def respond(
     temperature,
     top_p,
     use_local_model: bool,
-    hf_token: Optional[object] = None,
+    _unused_login: Optional[object] = None,   # OAuth disabled; keep arg to satisfy Gradio signature
 ):
     global pipe, tokenizer
 
@@ -179,18 +112,13 @@ def respond(
 
     try:
         fact = random.choice(WPI_FACTS)["text"]
-        messages = [{"role": "system", "content": system_message}]
-        messages.extend(history)
-        messages.append({"role": "user", "content": f"{message}\n\nFun fact: {fact}"})
+        user_with_fact = f"{message}\n\nFun fact: {fact}"
 
-        response = ""
-
+        # ---- LOCAL MODEL PATH ----
         if use_local_model:
-            # ---- LOCAL MODEL PATH ----
             from transformers import pipeline, AutoTokenizer
-            import torch
-
             try:
+                import torch
                 torch.set_num_threads(2)
             except Exception:
                 pass
@@ -205,15 +133,18 @@ def respond(
                     trust_remote_code=True,
                 )
 
-            prompt = _build_local_prompt(messages)
+            local_msgs = [{"role": "system", "content": system_message}] + (history or []) + [
+                {"role": "user", "content": user_with_fact}
+            ]
+            prompt = _build_local_prompt(local_msgs)
             outputs = pipe(
                 prompt,
                 max_new_tokens=int(max_tokens),
                 do_sample=True,
                 temperature=float(temperature),
                 top_p=float(top_p),
-                pad_token_id=tokenizer.eos_token_id,
-                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=getattr(tokenizer, "eos_token_id", None),
+                eos_token_id=getattr(tokenizer, "eos_token_id", None),
             )
             full = outputs[0]["generated_text"]
             assistant = full[len(prompt):].strip()
@@ -222,75 +153,103 @@ def respond(
 
             token_estimate += max(0, len(assistant)) // 4
             yield assistant
+            return
 
-        else:
-            # ---- HUGGING FACE API PATH via Router (OpenAI-compatible) ----
-            model_id = HF_MODEL_ID
-            token_value = os.getenv("HF_TOKEN", "").strip()
-            if not token_value:
+        # ---- API PATH (OpenAI-compatible preferred; else HF Router) ----
+        # Prefer OpenAI-compatible if an API key is available
+        if OPENAI_API_KEY:
+            base = (OPENAI_BASE_URL or "https://openrouter.ai/api").rstrip("/")
+            url = f"{base}/v1/chat/completions"
+            headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+            msgs = _build_chat_messages(system_message, history or [], user_with_fact)
+            payload = {
+                "model": HF_MODEL_ID,  # reuse same env var to pick model name
+                "messages": msgs,
+                "max_tokens": int(max_tokens),
+                "temperature": float(temperature),
+                "top_p": float(top_p),
+            }
+            try:
+                t0 = time.time()
+                r = requests.post(url, headers=headers, json=payload, timeout=120)
+                if r.status_code == 401:
+                    status = "error"
+                    yield "⚠️ Auth failed (401). Check OPENAI_API_KEY (OpenRouter/Together/OpenAI) and model access."
+                elif r.status_code >= 400:
+                    status = "error"
+                    yield f"⚠️ API error {r.status_code}: {r.text[:300]}"
+                else:
+                    data = r.json()
+                    text = data["choices"][0]["message"]["content"]
+                    RESP_LATENCY.observe(time.time() - t0)
+                    token_estimate += max(0, len(text)) // 4
+                    yield text
+            except requests.Timeout:
                 status = "error"
-                yield "🔐 Please log in to Hugging Face or set HF_TOKEN to use the API path."
+                yield "⚠️ API timeout. Try again or lower max tokens."
+            except Exception as e:
+                status = "error"
+                yield f"⚠️ API request failed: {e}"
+            return
+
+        # Else: Hugging Face Router (requires HF_TOKEN)
+        if not HF_TOKEN:
+            status = "error"
+            yield "🔐 Please log in to Hugging Face or set HF_TOKEN to use the API path."
+            return
+
+        url = f"{HF_BASE_URL.rstrip('/')}/v1/completions"
+        headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+        msgs = _build_chat_messages(system_message, history or [], user_with_fact)
+        prompt = _build_hf_chat_prompt(msgs)
+        payload = {
+            "model": HF_MODEL_ID,
+            "prompt": prompt,
+            "max_tokens": int(max_tokens),
+            "temperature": float(temperature),
+            "top_p": float(top_p),
+        }
+        try:
+            t0 = time.time()
+            r = requests.post(url, headers=headers, json=payload, timeout=120)
+            if r.status_code == 401:
+                status = "error"
+                yield "⚠️ Hugging Face auth failed (401). Ensure HF_TOKEN is valid and model terms are accepted."
+            elif r.status_code == 404:
+                status = "error"
+                yield ("⚠️ Model not found at router (404). "
+                       "Try a public model like `google/gemma-2-2b-it`, `mistralai/Mistral-7B-Instruct-v0.3`, "
+                       "or switch to an OpenAI-compatible provider via OPENAI_API_KEY.")
+            elif r.status_code >= 400:
+                status = "error"
+                yield f"⚠️ HF Router error {r.status_code}: {r.text[:300]}"
             else:
-                prompt = _build_hf_chat_prompt(messages)
-
-                url = f"{HF_BASE_URL.rstrip('/')}/v1/completions"
-                headers = {"Authorization": f"Bearer {token_value}"}
-                payload = {
-                    "model": model_id,
-                    "prompt": prompt,
-                    "max_tokens": int(max_tokens),
-                    "temperature": float(temperature),
-                    "top_p": float(top_p)
-                }
-                try:
-                    t0 = time.time()
-                    import requests
-                    r = requests.post(url, headers=headers, json=payload, timeout=120)
-                    if r.status_code == 401:
-                        status = "error"
-                        yield "⚠️ Hugging Face auth failed (401). Ensure HF_TOKEN is valid and model terms are accepted."
-                    elif r.status_code == 404:
-                        status = "error"
-                        yield ("⚠️ Model not found at the router (404). "
-                               "Double-check HF_MODEL_ID or try `mistralai/Mistral-7B-Instruct-v0.3`.")
-                    elif r.status_code >= 400:
-                        status = "error"
-                        yield f"⚠️ HF Router error {r.status_code}: {r.text[:300]}"
-                    else:
-                        data = r.json()
-                        text = ""
-                        try:
-                            text = data["choices"][0].get("text") or ""
-                        except Exception:
-                            text = str(data)[:500]
-                        RESP_LATENCY.observe(time.time() - t0)
-                        TOKENS_OUT.labels(PRODUCT_KIND).inc(max(0, len(text)) // 4)
-                        yield text
-                except requests.Timeout:
-                    status = "error"
-                    yield "⚠️ HF Router timeout. Try again or lower max tokens."
-                except Exception as e:
-                    status = "error"
-                    yield f"⚠️ HF request failed: {e}"
-
-
+                data = r.json()
+                text = data["choices"][0].get("text") or ""
+                RESP_LATENCY.observe(time.time() - t0)
+                token_estimate += max(0, len(text)) // 4
+                yield text
+        except requests.Timeout:
+            status = "error"
+            yield "⚠️ HF Router timeout. Try again or lower max tokens."
+        except Exception as e:
+            status = "error"
+            yield f"⚠️ HF request failed: {e}"
 
     except Exception:
         status = "error"
         raise
     finally:
-        # ---- METRICS UPDATE ----
         REQS_TOTAL.labels(PRODUCT_KIND, status).inc()
         ACTIVE_SESSIONS.set(0 if not history else len(history))
         RESP_LATENCY.observe(time.time() - start_time)
         TOKENS_OUT.labels(PRODUCT_KIND).inc(token_estimate)
 
-
-def create_demo(enable_oauth: bool = True):
+def create_demo(enable_oauth: bool = False):
     with gr.Blocks(css=fancy_css) as demo:
         with gr.Row():
             gr.Markdown("<h1 id='title'>🐐 Chat with Gompei</h1>")
-            token_input = gr.LoginButton() if enable_oauth else gr.State(value=None)
+            token_input = gr.State(value=None)  # disable OAuth to avoid confusion
 
         gr.ChatInterface(
             fn=respond,
@@ -322,26 +281,21 @@ def create_demo(enable_oauth: bool = True):
     return demo
 
 # Auto-create UI unless tests/CI ask us not to
-if os.environ.get("SKIP_UI_ON_IMPORT") != "1":
-    _enable_oauth = os.getenv("ENABLE_OAUTH", "0").lower() not in ("0", "false", "no")
-    demo = create_demo(enable_oauth=_enable_oauth)
+if os.getenv("SKIP_UI_ON_IMPORT") != "1":
+    demo = create_demo(enable_oauth=False)
 
 if __name__ == "__main__":
     # Start Prometheus metrics server on :8000 before launching UI
     start_http_server(8000)
     BUILD_INFO.info({
         "version": "cs3",
-        "provider": os.getenv("API_PROVIDER", "local"),
-        "local_model": os.getenv("LOCAL_MODEL", ""),
-        "hf_model_id": os.getenv("HF_MODEL_ID", ""),
-        "nebius_model": os.getenv("NEBIUS_MODEL", ""),
+        "provider": "openai-compatible" if OPENAI_API_KEY else "hf-router",
+        "local_model": LOCAL_MODEL,
+        "hf_model_id": HF_MODEL_ID,
         "product": PRODUCT_KIND,
     })
-
     if "demo" not in globals():
-        _enable_oauth = os.getenv("ENABLE_OAUTH", "0").lower() not in ("0", "false", "no")
-        demo = create_demo(enable_oauth=_enable_oauth)
-
+        demo = create_demo(enable_oauth=False)
     demo.queue().launch(
         server_name=os.getenv("GRADIO_SERVER_NAME", "0.0.0.0"),
         server_port=int(os.getenv("GRADIO_SERVER_PORT", "7860")),
