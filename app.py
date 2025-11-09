@@ -160,7 +160,9 @@ def respond(
         if OPENAI_API_KEY:
             base = (OPENAI_BASE_URL or "https://openrouter.ai/api").rstrip("/")
             url = f"{base}/v1/chat/completions"
-            headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+            headers = {
+                "Authorization": f"Bearer {OPENAI_API_KEY}", "HTTP-Referer": os.getenv("OR_REFERER", "http://localhost"), "X-Title": os.getenv("OR_TITLE", "Gompei CS3"),}
+
             msgs = _build_chat_messages(system_message, history or [], user_with_fact)
             payload = {
                 "model": HF_MODEL_ID,  # reuse same env var to pick model name
