@@ -1,4 +1,9 @@
-# app.py
+# app.py (CS3 compliant)
+# - Exposes Python Prometheus metrics on :8000
+# - Gradio UI on :7860 (binds 0.0.0.0 for Docker)
+# - Distinguishes local vs API product via PRODUCT_KIND env
+# - Avoids double-counting RESP_LATENCY (observed once in finally)
+
 import os, json, random, time
 from typing import Optional
 
@@ -55,6 +60,7 @@ except Exception:
 fancy_css = "#title { text-align:center; }"
 
 # -------- Helpers --------
+
 def _build_local_prompt(msgs: list[dict[str, str]]) -> str:
     """Simple chat-ish prompt for local text-generation."""
     parts = []
@@ -69,12 +75,14 @@ def _build_local_prompt(msgs: list[dict[str, str]]) -> str:
     parts.append("Assistant:")
     return "\n".join(parts)
 
+
 def _build_chat_messages(system_message: str, history: list[dict[str, str]], user_text: str):
     """Build OpenAI-style chat messages."""
     msgs = [{"role": "system", "content": system_message}]
     msgs.extend(history or [])
     msgs.append({"role": "user", "content": user_text})
     return msgs
+
 
 def _build_hf_chat_prompt(msgs: list[dict[str, str]]) -> str:
     """Simple chat-style prompt for HF /v1/completions."""
@@ -93,6 +101,7 @@ def _build_hf_chat_prompt(msgs: list[dict[str, str]]) -> str:
 # ---- Core chat handler ----
 pipe = None
 tokenizer = None
+
 
 def respond(
     message,
@@ -174,7 +183,6 @@ def respond(
                 "top_p": float(top_p),
             }
             try:
-                t0 = time.time()
                 r = requests.post(url, headers=headers, json=payload, timeout=120)
                 if r.status_code == 401:
                     status = "error"
@@ -185,7 +193,6 @@ def respond(
                 else:
                     data = r.json()
                     text = data["choices"][0]["message"]["content"]
-                    RESP_LATENCY.observe(time.time() - t0)
                     token_estimate += max(0, len(text)) // 4
                     yield text
             except requests.Timeout:
@@ -214,7 +221,6 @@ def respond(
             "top_p": float(top_p),
         }
         try:
-            t0 = time.time()
             r = requests.post(url, headers=headers, json=payload, timeout=120)
             if r.status_code == 401:
                 status = "error"
@@ -230,7 +236,6 @@ def respond(
             else:
                 data = r.json()
                 text = data["choices"][0].get("text") or ""
-                RESP_LATENCY.observe(time.time() - t0)
                 token_estimate += max(0, len(text)) // 4
                 yield text
         except requests.Timeout:
@@ -244,16 +249,18 @@ def respond(
         status = "error"
         raise
     finally:
+        # One end-to-end latency observation per request
+        RESP_LATENCY.observe(time.time() - start_time)
         REQS_TOTAL.labels(PRODUCT_KIND, status).inc()
         ACTIVE_SESSIONS.set(0 if not history else len(history))
-        RESP_LATENCY.observe(time.time() - start_time)
         TOKENS_OUT.labels(PRODUCT_KIND).inc(token_estimate)
+
 
 def create_demo(enable_oauth: bool = False):
     with gr.Blocks(css=fancy_css) as demo:
         with gr.Row():
             gr.Markdown("<h1 id='title'>🐐 Chat with Gompei</h1>")
-            token_input = gr.State(value=None)  # disable OAuth to avoid confusion
+            token_input = gr.State(value=None)  # OAuth disabled; keep state slot
 
         gr.ChatInterface(
             fn=respond,
