@@ -1,5 +1,5 @@
-gradio==4.44.1
-huggingface_hub==0.23.5
-prometheus_client
-transformers
-torch
+transformers>=4.40
+accelerate>=0.26.0
+torch>=2.1
+gradio>=4.0
+prometheus-client
