@@ -23,7 +23,7 @@ print("[CS3] STARTUP")
 PRODUCT_KIND = os.getenv("PRODUCT_KIND", "unknown")  # "local" | "api" | "unknown"
 
 # Local model
-LOCAL_MODEL = os.getenv("LOCAL_MODEL", "sshleifer/tiny-gpt2").strip()
+LOCAL_MODEL = os.getenv("LOCAL_MODEL", "microsoft/Phi-3-mini-4k-instruct").strip()
 
 # OpenAI-compatible provider (OpenRouter / Together / OpenAI)
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "").strip()
