@@ -1,9 +1,8 @@
-# app.py (CS3 compliant, with safe fallbacks)
+# app.py (CS3 compliant, simplified local model to avoid DynamicCache issues)
 # - Prometheus metrics on :8000
 # - Gradio UI on :7860 (0.0.0.0 for Docker)
 # - Local vs API selection via checkbox + env
 # - Falls back to local model if no API creds
-# - Avoids double-counting RESP_LATENCY
 
 import os
 import json
@@ -22,7 +21,7 @@ print("[CS3] STARTUP")
 
 PRODUCT_KIND = os.getenv("PRODUCT_KIND", "unknown")  # "local" | "api" | "unknown"
 
-# Local model
+# Local model – use Phi-3-mini like your last working version
 LOCAL_MODEL = os.getenv("LOCAL_MODEL", "microsoft/Phi-3-mini-4k-instruct").strip()
 
 # OpenAI-compatible provider (OpenRouter / Together / OpenAI)
@@ -129,8 +128,7 @@ def _build_hf_chat_prompt(msgs: list[dict[str, str]]) -> str:
 
 # ========== State for local model ==========
 
-pipe = None
-tokenizer = None
+pipe = None  # simple pipeline object, like in your old code
 
 
 # ========== Core chat handler ==========
@@ -152,9 +150,9 @@ def respond(
     - Else:
         - If OPENAI_API_KEY set → OpenAI-compatible API path.
         - Elif HF_TOKEN set → Hugging Face Router /v1/completions.
-        - Else → fall back to local model (no more 🔐 error).
+        - Else → fall back to local model (no 🔐 error).
     """
-    global pipe, tokenizer
+    global pipe
 
     start_time = time.time()
     token_estimate = 0
@@ -173,27 +171,13 @@ def respond(
 
         # ---------- LOCAL MODEL PATH ----------
         if effective_use_local:
-            print("[CS3] MODE=local")
+            print(f"[CS3] MODE=local (model={LOCAL_MODEL})")
             try:
-                from transformers import pipeline, AutoTokenizer
-                try:
-                    import torch
-                    torch.set_num_threads(2)
-                except Exception:
-                    pass
+                from transformers import pipeline
 
-                if pipe is None or tokenizer is None:
-                    tokenizer = AutoTokenizer.from_pretrained(
-                        LOCAL_MODEL,
-                        trust_remote_code=True,
-                    )
-                    pipe = pipeline(
-                        "text-generation",
-                        model=LOCAL_MODEL,
-                        tokenizer=tokenizer,
-                        device_map="auto",
-                        trust_remote_code=True,
-                    )
+                if pipe is None:
+                    # Simple pipeline, just like your last working version
+                    pipe = pipeline("text-generation", model=LOCAL_MODEL)
 
                 local_msgs = (
                     [{"role": "system", "content": system_message}]
@@ -201,17 +185,17 @@ def respond(
                     + [{"role": "user", "content": user_with_fact}]
                 )
                 prompt = _build_local_prompt(local_msgs)
+
                 outputs = pipe(
                     prompt,
                     max_new_tokens=int(max_tokens),
                     do_sample=True,
                     temperature=float(temperature),
                     top_p=float(top_p),
-                    pad_token_id=getattr(tokenizer, "eos_token_id", None),
-                    eos_token_id=getattr(tokenizer, "eos_token_id", None),
                 )
-                full = outputs[0]["generated_text"]
-                assistant = full[len(prompt):].strip()
+
+                full_text = outputs[0]["generated_text"]
+                assistant = full_text[len(prompt):].strip()
                 if "Assistant:" in assistant:
                     assistant = assistant.split("Assistant:", 1)[-1].strip()
 
@@ -267,7 +251,6 @@ def respond(
             return
 
         # ---------- API PATH (HF ROUTER) ----------
-        # We know OPENAI_API_KEY is empty here. Use HF_TOKEN if available.
         if HF_TOKEN:
             print("[CS3] MODE=api (HF Router)")
             url = f"{HF_BASE_URL.rstrip('/')}/v1/completions"
@@ -332,8 +315,7 @@ def create_demo(enable_oauth: bool = False):
     with gr.Blocks(css=fancy_css) as demo:
         with gr.Row():
             gr.Markdown("<h1 id='title'>🐐 Chat with Gompei</h1>")
-            # CS3: OAuth disabled; keep a dummy state to match fn signature
-            token_input = gr.State(value=None)
+            token_input = gr.State(value=None)  # dummy to match fn signature
 
         gr.ChatInterface(
             fn=respond,
@@ -366,8 +348,8 @@ def create_demo(enable_oauth: bool = False):
                     step=0.05,
                     label="Top-p (nucleus sampling)",
                 ),
-                gr.Checkbox(label="Use Local Model", value=False),
-                token_input,  # placeholder for _unused_login
+                gr.Checkbox(label="Use Local Model", value=True),  # default ON now
+                token_input,
             ],
             type="messages",
             examples=[
@@ -380,7 +362,7 @@ def create_demo(enable_oauth: bool = False):
                     128,
                     0.7,
                     0.95,
-                    False,
+                    True,
                     None,
                 ],
                 [
@@ -392,7 +374,7 @@ def create_demo(enable_oauth: bool = False):
                     128,
                     0.7,
                     0.95,
-                    False,
+                    True,
                     None,
                 ],
             ],
